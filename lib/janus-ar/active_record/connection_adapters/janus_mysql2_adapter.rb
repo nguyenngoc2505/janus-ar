@@ -36,13 +36,16 @@ module ActiveRecord
       end
 
       def initialize(*args)
-        args[0][:janus]['replica']['database'] = args[0][:database]
+        # args[0][:janus]['replica']['database'] = args[0][:database]
         args[0][:janus]['primary']['database'] = args[0][:database]
 
         @replica_config = args[0][:janus]['replica']
+        @replica_configs = args[0][:janus]['replicas']
+        @replica_index = 0
         args[0] = args[0][:janus]['primary']
 
         super(*args)
+
         @connection_parameters ||= args[0]
         update_config
       end
@@ -51,14 +54,13 @@ module ActiveRecord
         self
       end
 
-      def raw_execute(sql, name = nil, binds = [], prepare: false, async: false, allow_retry: false,
-        materialize_transactions: true, batch: false)
+      def raw_execute(sql, name, async: false, allow_retry: false, materialize_transactions: true)
         case where_to_send?(sql)
         when :all
-          send_to_replica(sql, connection: :all, method: :raw_execute)
+          send_to_replica(sql, connection: :all, method: :raw_execute, name: name)
           super
         when :replica
-          send_to_replica(sql, connection: :replica, method: :raw_execute)
+          send_to_replica(sql, connection: :replica, method: :raw_execute, name: name)
         else
           Janus::Context.stick_to_primary if write_query?(sql)
           Janus::Context.used_connection(:primary)
@@ -66,13 +68,13 @@ module ActiveRecord
         end
       end
 
-      def execute(sql)
+      def execute(sql, name = nil, allow_retry: false)
         case where_to_send?(sql)
         when :all
-          send_to_replica(sql, connection: :all, method: :execute)
+          send_to_replica(sql, connection: :all, method: :execute, name: name)
           super(sql)
         when :replica
-          send_to_replica(sql, connection: :replica, method: :execute)
+          send_to_replica(sql, connection: :replica, method: :execute, name: name)
         else
           Janus::Context.stick_to_primary if write_query?(sql)
           Janus::Context.used_connection(:primary)
@@ -80,13 +82,13 @@ module ActiveRecord
         end
       end
 
-      def execute_and_free(sql, name = nil, async: false)
+      def execute_and_free(sql, name = nil, async: false, allow_retry: false)
         case where_to_send?(sql)
         when :all
-          send_to_replica(sql, connection: :all, method: :execute)
-          super(sql, name, async:)
+          send_to_replica(sql, connection: :all, method: :execute, name: name)
+          super(sql, name, async:, allow_retry: allow_retry)
         when :replica
-          send_to_replica(sql, connection: :replica, method: :execute)
+          send_to_replica(sql, connection: :replica, method: :execute, name: name)
         else
           Janus::Context.stick_to_primary if write_query?(sql)
           Janus::Context.used_connection(:primary)
@@ -115,7 +117,16 @@ module ActiveRecord
       end
 
       def replica_connection
-        @replica_connection ||= ActiveRecord::ConnectionAdapters::Mysql2Adapter.new(@replica_config)
+        @replica_name = "replica_#{@replica_index + 1}"
+        connection = @replica_connections[@replica_index]
+        @replica_index = (@replica_index + 1) % @replica_configs.size
+        connection
+      end
+
+      def get_replica_connections
+        @replica_connections ||= @replica_configs.map do |r_name, replica_config|
+          ActiveRecord::ConnectionAdapters::Mysql2Adapter.new(replica_config)
+        end
       end
 
       private
@@ -124,14 +135,17 @@ module ActiveRecord
         Janus::QueryDirector.new(sql, open_transactions).where_to_send?
       end
 
-      def send_to_replica(sql, connection: nil, method: :exec_query)
-        Janus::Context.used_connection(connection) if connection
+      def send_to_replica(sql, connection: nil, method: :exec_query, name: "SQL")
+        name ||= "SQL"
+        if @replica_name || connection
+          Janus::Context.used_connection(@replica_name || connection)
+        end
         if method == :execute
-          replica_connection.execute(sql)
+          replica_connection.exec_query(sql, name)
         elsif method == :raw_execute
-          replica_connection.execute(sql)
+          replica_connection.exec_query(sql, name)
         else
-          replica_connection.exec_query(sql)
+          replica_connection.exec_query(sql, name)
         end
       end
 
